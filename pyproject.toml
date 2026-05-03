@@ -1,0 +1,11 @@
+[project]
+name = "gl-supp"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "mach-beamform>=0.1.0",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.4",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+]
