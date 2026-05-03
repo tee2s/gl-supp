@@ -13,5 +13,5 @@ uv sync
 Run the beamforming script, for example:
 
 ```bash
-uv run python beamform.py --start 0 --stop 100 --mode both --channel-skip 8
+python beamform.py 115601.mat --start 40 --stop 70 --step 3  --mode both --channel-skip 16
 ```
