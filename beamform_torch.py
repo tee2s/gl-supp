@@ -268,8 +268,6 @@ def main():
                 rx_coords_m=elem_pos_m_full_bf,
                 tx_wave_arrivals_s=tx_arrivals[i],
                 out=hri_full,
-                f_number=1.0,
-                tukey_alpha=0.1,
                 **beamform_kwargs,
             )
         
