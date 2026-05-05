@@ -1,4 +1,6 @@
 import argparse
+from pathlib import Path
+
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,6 +11,12 @@ from mach import beamform
 def main():
     # --- 1. Parse Command Line Arguments ---
     parser = argparse.ArgumentParser(description="Beamform ultrasound frames with optional Rx downsampling.")
+    parser.add_argument(
+        "data_file",
+        nargs="?",
+        default="131626.mat",
+        help="Input RF data .mat file, either a full path or a filename in the data directory",
+    )
     parser.add_argument('--start', type=int, default=0, help="Start frame index")
     parser.add_argument('--stop', type=int, default=2, help="Stop frame index (exclusive)")
     parser.add_argument('--step', type=int, default=1, help="Frame step size")
@@ -19,10 +27,17 @@ def main():
     args = parser.parse_args()
 
     # --- 2. Load Data and Acquisition Parameters ---
-    setup_path = "/proj/yzlinlab/projects/jhu_spatiotemporal/data260421/setup.mat"
+    base_dir = Path("/proj/yzlinlab/projects/jhu_spatiotemporal/data260421")
+    data_path = Path(args.data_file)
+    
+    if not data_path.is_absolute():
+        data_path = base_dir / data_path
+
+    print(f"Processing Data in {data_path}")
+    
+    setup_path = base_dir / "setup.mat"
     setup = loadmat(setup_path, squeeze_me=True, struct_as_record=False)
     
-    data_path = "/proj/yzlinlab/projects/jhu_spatiotemporal/data260421/131626.mat"
     f = h5py.File(data_path, 'r')
     ref = f['RcvData'][0, 0]
     
@@ -127,9 +142,9 @@ def main():
                     tx_wave_arrivals_s=tx_arrivals_i,
                     rx_start_s=rx_start_s,
                     sampling_freq_hz=fs,
-                    f_number=1.0,
+                    f_number=0.5,
                     sound_speed_m_s=c,
-                    tukey_alpha=0.1
+                    tukey_alpha=0.0
                 )
                 hri_sparse += lri_sparse
                 
@@ -144,7 +159,7 @@ def main():
 
     # --- 5. Plot Side-by-Side ---
     print("Generating comparison plot...")
-    dynamic_range = 60.0
+    dynamic_range = 50.0
     extent = [x.min() * lam * 1e3, x.max() * lam * 1e3, z.max() * lam * 1e3, z.min() * lam * 1e3]
     
     # Setup grid rows based on mode. squeeze=False ensures axes is always a 2D array [row, col]
@@ -184,7 +199,7 @@ def main():
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
 
     plt.tight_layout()
-    plot_filename = f"b_mode_frames_{args.start}_to_{args.stop}_step_{args.step}_mode_{args.mode}.png"
+    plot_filename = f"b_mode_{data_path.stem}_frames_{args.start}_to_{args.stop}_step_{args.step}_mode_{args.mode}.png"
     plt.savefig(plot_filename, dpi=300, bbox_inches="tight")
     print(f"Done! Plot saved as '{plot_filename}'")
 
