@@ -1,9 +1,11 @@
 import argparse
+import time
 from pathlib import Path
 
 import h5py
 import matplotlib.pyplot as plt
 import torch
+from matplotlib.animation import FuncAnimation, writers
 from mach import beamform
 from mach.kernel import InterpolationType
 from scipy.io import loadmat
@@ -71,6 +73,64 @@ def log_compress_for_display(image, *, dynamic_range, eps=1e-12):
     return torch.clamp(log_image, min=-dynamic_range, max=0).detach().cpu().numpy()
 
 
+def save_video(
+    *,
+    filename,
+    mode,
+    sparse_frames,
+    full_frames,
+    frame_numbers,
+    channel_skip,
+    dynamic_range,
+    extent,
+    fps=10,
+):
+    if not writers.is_available("ffmpeg"):
+        raise RuntimeError("Matplotlib ffmpeg writer is not available; install ffmpeg to save MP4 output.")
+
+    n_rows = 2 if mode == 'both' else 1
+    fig, axes = plt.subplots(n_rows, 1, figsize=(7, 7 * n_rows), squeeze=False)
+
+    row_sparse = 0 if mode in ['sparse', 'both'] else None
+    row_full = 1 if mode == 'both' else (0 if mode == 'full' else None)
+    images = []
+
+    if mode in ['sparse', 'both']:
+        ax = axes[row_sparse, 0]
+        im = ax.imshow(sparse_frames[0], cmap="gray", vmin=-dynamic_range, vmax=0, extent=extent)
+        ax.set_xlabel("Lateral (mm)")
+        ax.set_ylabel("Axial (mm)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
+        images.append(("sparse", im, ax))
+
+    if mode in ['full', 'both']:
+        ax = axes[row_full, 0]
+        im = ax.imshow(full_frames[0], cmap="gray", vmin=-dynamic_range, vmax=0, extent=extent)
+        ax.set_xlabel("Lateral (mm)")
+        ax.set_ylabel("Axial (mm)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
+        images.append(("full", im, ax))
+
+    def update(frame_idx):
+        artists = []
+        frame_number = frame_numbers[frame_idx]
+        for image_kind, im, ax in images:
+            if image_kind == "sparse":
+                im.set_data(sparse_frames[frame_idx])
+                ax.set_title(f"Sparse Rx (skip={channel_skip}) - Frame {frame_number}")
+            else:
+                im.set_data(full_frames[frame_idx])
+                ax.set_title(f"Full Array - Frame {frame_number}")
+            artists.append(im)
+        return artists
+
+    update(0)
+    fig.tight_layout()
+    animation = FuncAnimation(fig, update, frames=len(frame_numbers), blit=False)
+    animation.save(filename, writer="ffmpeg", fps=fps, dpi=200)
+    plt.close(fig)
+
+
 def precompute_tx_arrivals(*, tx_events, elem_pos_m_full, scan_coords_m, fc, lam, sound_speed_m_s, dtype):
     focal_points = []
     t_focus_values = []
@@ -136,12 +196,26 @@ def main():
         default="float32",
         help="Torch dtype for geometry and timing calculations",
     )
+    parser.add_argument(
+        "--out-format",
+        choices=["plot", "video", "both"],
+        default="plot",
+        help="Output format: PNG plot, MP4 video, or both",
+    )
+    parser.add_argument(
+        "--frame-batch-size",
+        type=int,
+        default=10,
+        help="Number of frames to load and beamform at once",
+    )
     args = parser.parse_args()
 
     if args.step <= 0:
         raise ValueError("--step must be positive.")
     if args.channel_skip <= 0:
         raise ValueError("--channel-skip must be positive.")
+    if args.frame_batch_size <= 0:
+        raise ValueError("--frame-batch-size must be positive.")
 
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)
@@ -161,36 +235,23 @@ def main():
     setup_path = base_dir / "setup.mat"
     setup = loadmat(setup_path, squeeze_me=True, struct_as_record=False)
     
-    with h5py.File(data_path, 'r') as f:
-        ref = f['RcvData'][0, 0]
-
-        # Constants
-        c = 1540.0
-        fc = float(setup["Trans"].frequency * 1e6)
-        fs = 4 * fc
-        lam = c / fc
-        n_rx = 128
-        n_tx = 128
-        n_total_samples = 245760 # 1920 * 128
-        
-        receive0 = setup["Receive"][0]
-        start_depth = receive0.startDepth
-        end_depth = receive0.endDepth
-        n_valid_samples_per_tx = int(2 * (end_depth - start_depth) * (fs / fc))
-
-        print(f"Loading frames {args.start} to {args.stop} with step {args.step}...")
-        rf_full = f[ref][args.start:args.stop:args.step, :, :n_total_samples]
-
-    n_frames_loaded = rf_full.shape[0]
-    if n_frames_loaded == 0:
+    frame_indices = list(range(args.start, args.stop, args.step))
+    if not frame_indices:
         raise ValueError("No frames were loaded; check --start, --stop, and --step.")
 
-    # Reshape: (n_frames, n_rx, n_tx, n_samples_per_tx)
-    rf_full = as_contiguous_tensor(rf_full, device=device, dtype=beamform_dtype)
-    rf_full = rf_full.reshape(n_frames_loaded, n_rx, n_tx, -1)
-    rf_full = rf_full[:, :, :, :n_valid_samples_per_tx].contiguous()
-
-    print(f"Loaded RF shape: {tuple(rf_full.shape)}")
+    # Constants
+    c = 1540.0
+    fc = float(setup["Trans"].frequency * 1e6)
+    fs = 4 * fc
+    lam = c / fc
+    n_rx = 128
+    n_tx = 128
+    n_total_samples = 245760 # 1920 * 128
+    
+    receive0 = setup["Receive"][0]
+    start_depth = receive0.startDepth
+    end_depth = receive0.endDepth
+    n_valid_samples_per_tx = int(2 * (end_depth - start_depth) * (fs / fc))
 
     # --- 3. Image Grid Construction ---
     pdata = setup["PData"]
@@ -226,30 +287,15 @@ def main():
         dtype=dtype,
     ).to(dtype=beamform_dtype).contiguous()
 
-   
-    rf_events_full = (
-        rf_full.permute(2, 1, 3, 0).contiguous()
-        if args.mode in ['full', 'both']
-        else None
-    )
-    rf_events_sparse = (
-        rf_full[:, ::args.channel_skip, :, :].permute(2, 1, 3, 0).contiguous()
-        if args.mode in ['sparse', 'both']
-        else None
-    )
-    
-    hri_full = (
-        torch.zeros((scan_coords_m.shape[0], n_frames_loaded), device=device, dtype=beamform_dtype)
-        if args.mode in ['full', 'both']
-        else None
-    )
-    hri_sparse = (
-        torch.zeros((scan_coords_m.shape[0], n_frames_loaded), device=device, dtype=beamform_dtype)
-        if args.mode in ['sparse', 'both']
-        else None
-    )
+    dynamic_range = 50.0
+    frame_numbers = []
+    sparse_display_frames = []
+    full_display_frames = []
 
-    print(f"Beamforming {n_frames_loaded} frame(s) across {n_tx} transmit event(s)...")
+    print(
+        f"Beamforming {len(frame_indices)} frame(s) across {n_tx} transmit event(s) "
+        f"in batches of {args.frame_batch_size}..."
+    )
     beamform_kwargs = dict(
         scan_coords_m=scan_coords_m_bf,
         rx_start_s=rx_start_s,
@@ -260,87 +306,173 @@ def main():
         tukey_alpha=0.1,
     )
 
-    for i in range(n_tx):
-        # Full beamforming
-        if args.mode in ['full', 'both']:
-            beamform(
-                channel_data=rf_events_full[i],
-                rx_coords_m=elem_pos_m_full_bf,
-                tx_wave_arrivals_s=tx_arrivals[i],
-                out=hri_full,
-                **beamform_kwargs,
-            )
-        
-        # Sparse beamforming (Downsampled Rx)
-        if args.mode in ['sparse', 'both']:
-            beamform(
-                channel_data=rf_events_sparse[i],
-                rx_coords_m=elem_pos_m_sparse_bf,
-                tx_wave_arrivals_s=tx_arrivals[i],
-                out=hri_sparse,
-                **beamform_kwargs,
-            )
-            
-    # Envelope detection
-    envelopes_full = []
-    envelopes_sparse = []
+    total_data_load_elapsed_s = 0.0
+    with h5py.File(data_path, 'r') as f:
+        ref = f['RcvData'][0, 0]
 
-    if args.mode in ['full', 'both']:
-        env_full = torch_hilbert_envelope(hri_full.reshape((nz, nx, n_frames_loaded)), dim=0)
-        envelopes_full = [env_full[:, :, idx] for idx in range(n_frames_loaded)]
-        
-    if args.mode in ['sparse', 'both']:
-        env_sparse = torch_hilbert_envelope(hri_sparse.reshape((nz, nx, n_frames_loaded)), dim=0)
-        envelopes_sparse = [env_sparse[:, :, idx] for idx in range(n_frames_loaded)]
+        for batch_offset in range(0, len(frame_indices), args.frame_batch_size):
+            batch_indices = frame_indices[batch_offset : batch_offset + args.frame_batch_size]
+            batch_start = batch_indices[0]
+            batch_stop = batch_indices[-1] + args.step
+            print(f"Loading frame batch {batch_indices[0]} to {batch_indices[-1]}...")
 
-    # --- 5. Plot Side-by-Side ---
-    print("Generating comparison plot...")
-    dynamic_range = 50.0
+            data_load_start = time.perf_counter()
+            rf_batch = f[ref][batch_start:batch_stop:args.step, :, :n_total_samples]
+            data_load_elapsed_s = time.perf_counter() - data_load_start
+            total_data_load_elapsed_s += data_load_elapsed_s
+
+            n_batch_frames = rf_batch.shape[0]
+            if n_batch_frames == 0:
+                continue
+
+            batch_frame_numbers = batch_indices[:n_batch_frames]
+            print(f"Data loading took {data_load_elapsed_s:.2f} s")
+
+            # Reshape: (n_frames, n_rx, n_tx, n_samples_per_tx)
+            rf_batch = as_contiguous_tensor(rf_batch, device=device, dtype=beamform_dtype)
+            rf_batch = rf_batch.reshape(n_batch_frames, n_rx, n_tx, -1)
+            rf_batch = rf_batch[:, :, :, :n_valid_samples_per_tx].contiguous()
+            print(f"Loaded RF batch shape: {tuple(rf_batch.shape)}")
+
+            rf_events_full = (
+                rf_batch.permute(2, 1, 3, 0).contiguous()
+                if args.mode in ['full', 'both']
+                else None
+            )
+            rf_events_sparse = (
+                rf_batch[:, ::args.channel_skip, :, :].permute(2, 1, 3, 0).contiguous()
+                if args.mode in ['sparse', 'both']
+                else None
+            )
+
+            hri_full = (
+                torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
+                if args.mode in ['full', 'both']
+                else None
+            )
+            hri_sparse = (
+                torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
+                if args.mode in ['sparse', 'both']
+                else None
+            )
+
+            for i in range(n_tx):
+                # Full beamforming
+                if args.mode in ['full', 'both']:
+                    beamform(
+                        channel_data=rf_events_full[i],
+                        rx_coords_m=elem_pos_m_full_bf,
+                        tx_wave_arrivals_s=tx_arrivals[i],
+                        out=hri_full,
+                        **beamform_kwargs,
+                    )
+                
+                # Sparse beamforming (Downsampled Rx)
+                if args.mode in ['sparse', 'both']:
+                    beamform(
+                        channel_data=rf_events_sparse[i],
+                        rx_coords_m=elem_pos_m_sparse_bf,
+                        tx_wave_arrivals_s=tx_arrivals[i],
+                        out=hri_sparse,
+                        **beamform_kwargs,
+                    )
+                    
+            # Envelope detection and display compression for this batch.
+            if args.mode in ['full', 'both']:
+                env_full = torch_hilbert_envelope(hri_full.reshape((nz, nx, n_batch_frames)), dim=0)
+                full_display_frames.extend(
+                    log_compress_for_display(env_full[:, :, idx], dynamic_range=dynamic_range)
+                    for idx in range(n_batch_frames)
+                )
+                
+            if args.mode in ['sparse', 'both']:
+                env_sparse = torch_hilbert_envelope(hri_sparse.reshape((nz, nx, n_batch_frames)), dim=0)
+                sparse_display_frames.extend(
+                    log_compress_for_display(env_sparse[:, :, idx], dynamic_range=dynamic_range)
+                    for idx in range(n_batch_frames)
+                )
+
+            frame_numbers.extend(batch_frame_numbers)
+            del rf_batch, rf_events_full, rf_events_sparse, hri_full, hri_sparse
+
+    if not frame_numbers:
+        raise ValueError("No frames were loaded; check --start, --stop, and --step.")
+    n_frames_loaded = len(frame_numbers)
+    print(f"Total data loading took {total_data_load_elapsed_s:.2f} s")
+
+    # --- 5. Generate Outputs ---
     extent = [
         (x.min() * lam * 1e3).item(),
         (x.max() * lam * 1e3).item(),
         (z.max() * lam * 1e3).item(),
         (z.min() * lam * 1e3).item(),
     ]
-    
-    # Setup grid rows based on mode. squeeze=False ensures axes is always a 2D array [row, col]
-    n_rows = 2 if args.mode == 'both' else 1
-    fig, axes = plt.subplots(n_rows, n_frames_loaded, figsize=(7 * n_frames_loaded, 7 * n_rows), squeeze=False)
-    
-    row_sparse = 0 if args.mode in ['sparse', 'both'] else None
-    row_full = 1 if args.mode == 'both' else (0 if args.mode == 'full' else None)
 
-    for idx in range(n_frames_loaded):
-        original_frame = args.start + idx * args.step
+    output_stem = f"b_mode_{data_path.stem}_frames_{args.start}_to_{args.stop}_step_{args.step}_mode_{args.mode}"
+
+    if args.out_format in ["plot", "both"]:
+        print("Generating comparison plot...")
+    
+        # Setup grid rows based on mode. squeeze=False ensures axes is always a 2D array [row, col]
+        n_rows = 2 if args.mode == 'both' else 1
+        fig, axes = plt.subplots(n_rows, n_frames_loaded, figsize=(7 * n_frames_loaded, 7 * n_rows), squeeze=False)
         
-        # Plot Sparse
-        if args.mode in ['sparse', 'both']:
-            ax = axes[row_sparse, idx]
-            img = envelopes_sparse[idx]
-            log_img = log_compress_for_display(img, dynamic_range=dynamic_range)
-            
-            im = ax.imshow(log_img, cmap="gray", vmin=-dynamic_range, vmax=0, extent=extent)
-            ax.set_title(f"Sparse Rx (skip={args.channel_skip}) - Frame {original_frame}")
-            ax.set_xlabel("Lateral (mm)")
-            if idx == 0: ax.set_ylabel("Axial (mm)")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
+        row_sparse = 0 if args.mode in ['sparse', 'both'] else None
+        row_full = 1 if args.mode == 'both' else (0 if args.mode == 'full' else None)
 
-        # Plot Full
-        if args.mode in ['full', 'both']:
-            ax = axes[row_full, idx]
-            img = envelopes_full[idx]
-            log_img = log_compress_for_display(img, dynamic_range=dynamic_range)
-            
-            im = ax.imshow(log_img, cmap="gray", vmin=-dynamic_range, vmax=0, extent=extent)
-            ax.set_title(f"Full Array - Frame {original_frame}")
-            ax.set_xlabel("Lateral (mm)")
-            if idx == 0: ax.set_ylabel("Axial (mm)")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
+        for idx, original_frame in enumerate(frame_numbers):
+            # Plot Sparse
+            if args.mode in ['sparse', 'both']:
+                ax = axes[row_sparse, idx]
+                im = ax.imshow(
+                    sparse_display_frames[idx],
+                    cmap="gray",
+                    vmin=-dynamic_range,
+                    vmax=0,
+                    extent=extent,
+                )
+                ax.set_title(f"Sparse Rx (skip={args.channel_skip}) - Frame {original_frame}")
+                ax.set_xlabel("Lateral (mm)")
+                if idx == 0: ax.set_ylabel("Axial (mm)")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
 
-    plt.tight_layout()
-    plot_filename = f"b_mode_{data_path.stem}_frames_{args.start}_to_{args.stop}_step_{args.step}_mode_{args.mode}.png"
-    plt.savefig(plot_filename, dpi=300, bbox_inches="tight")
-    print(f"Done! Plot saved as '{plot_filename}'")
+            # Plot Full
+            if args.mode in ['full', 'both']:
+                ax = axes[row_full, idx]
+                im = ax.imshow(
+                    full_display_frames[idx],
+                    cmap="gray",
+                    vmin=-dynamic_range,
+                    vmax=0,
+                    extent=extent,
+                )
+                ax.set_title(f"Full Array - Frame {original_frame}")
+                ax.set_xlabel("Lateral (mm)")
+                if idx == 0: ax.set_ylabel("Axial (mm)")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
+
+        plt.tight_layout()
+        plot_filename = f"{output_stem}.png"
+        plt.savefig(plot_filename, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Plot saved as '{plot_filename}'")
+
+    if args.out_format in ["video", "both"]:
+        print("Generating MP4 video...")
+        video_filename = f"{output_stem}.mp4"
+        save_video(
+            filename=video_filename,
+            mode=args.mode,
+            sparse_frames=sparse_display_frames,
+            full_frames=full_display_frames,
+            frame_numbers=frame_numbers,
+            channel_skip=args.channel_skip,
+            dynamic_range=dynamic_range,
+            extent=extent,
+        )
+        print(f"Video saved as '{video_filename}'")
+
+    print("Done!")
 
 if __name__ == "__main__":
     main()
