@@ -16,6 +16,10 @@ Run the original beamforming script using NumPy, for example:
 python beamform.py 115601.mat --start 40 --stop 70 --step 3  --mode both --channel-skip 16
 ```
 
+```bash
+python beamform.py 115601.mat --start 0 --stop 100 --step 10  --mode both --channel-skip 16 --plot-img-data 
+```
+
 Run the PyTorch/mach version and save both the comparison plot and an MP4 video:
 
 ```bash
