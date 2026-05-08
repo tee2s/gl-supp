@@ -132,10 +132,10 @@ def save_video(
 
 
 def precompute_tx_arrivals(*, tx_events, elem_pos_m_full, scan_coords_m, fc, lam, sound_speed_m_s, dtype):
-    focal_points = []
-    t_focus_values = []
+    tx_arrivals = []
+    tx_weights = []
     
-    # loop to support different Apod mask shapes (might be able to remove)
+    # Loop to support different Apod masks and focused apertures per transmit.
     for tx_i in tx_events:
         apod = torch.as_tensor(tx_i.Apod, device=elem_pos_m_full.device) > 0
         delay_s = as_contiguous_tensor(tx_i.Delay, device=elem_pos_m_full.device, dtype=dtype) / fc
@@ -149,24 +149,34 @@ def precompute_tx_arrivals(*, tx_events, elem_pos_m_full, scan_coords_m, fc, lam
         dist_tx_to_focus = torch.linalg.vector_norm(elem_tx - focal_point[None, :], dim=-1)
         t_focus = torch.mean(delay_tx + dist_tx_to_focus / sound_speed_m_s)
 
-        focal_points.append(focal_point)
-        t_focus_values.append(t_focus)
+        if elem_tx.numel() > 0:
+            aperture_width = torch.amax(elem_tx[:, 0]) - torch.amin(elem_tx[:, 0])
+            aperture_width = torch.clamp(aperture_width, min=1e-4)
+        else:
+            aperture_width = torch.tensor(1e-4, device=elem_pos_m_full.device, dtype=dtype)
 
-    focal_points = torch.stack(focal_points, dim=0)
-    t_focus_values = torch.stack(t_focus_values, dim=0)
+        f_number = z_f / aperture_width
+        beam_waist = lam * f_number
+        rayleigh_range = torch.pi * (beam_waist**2) / lam
 
-    dist_pixel_to_focus = torch.linalg.vector_norm(
-        scan_coords_m[None, :, :] - focal_points[:, None, :],
-        dim=-1,
-    )
-    is_post_focal = scan_coords_m[None, :, 2] >= focal_points[:, None, 2]
-    sign = torch.where(
-        is_post_focal,
-        torch.ones((), device=scan_coords_m.device, dtype=dtype),
-        -torch.ones((), device=scan_coords_m.device, dtype=dtype),
-    )
-    tx_arrivals = t_focus_values[:, None] + (sign * dist_pixel_to_focus / sound_speed_m_s)
-    return tx_arrivals
+        z_diff = scan_coords_m[:, 2] - z_f
+        dx = scan_coords_m[:, 0] - x_f
+
+        epsilon_z = 1e-9
+        z_diff_safe = torch.where(
+            torch.abs(z_diff) < epsilon_z,
+            torch.full_like(z_diff, epsilon_z),
+            z_diff,
+        )
+        radius_curvature = z_diff_safe * (1.0 + (rayleigh_range / z_diff_safe) ** 2)
+        gaussian_distance = z_diff + (dx**2) / (2.0 * radius_curvature)
+        tx_arrivals.append(t_focus + gaussian_distance / sound_speed_m_s)
+
+        beam_width = beam_waist * torch.sqrt(1.0 + (z_diff / rayleigh_range) ** 2)
+        tx_weight = torch.sqrt(beam_waist / beam_width) * torch.exp(-(dx**2) / (beam_width**2))
+        tx_weights.append(tx_weight)
+
+    return torch.stack(tx_arrivals, dim=0), torch.stack(tx_weights, dim=0)
 
 
 def main():
@@ -276,8 +286,8 @@ def main():
     # Downsample receive element positions to match channel downsampling
     elem_pos_m_sparse_bf = elem_pos_m_full_bf[::args.channel_skip, :].contiguous()
 
-    print("Precomputing transmit arrival times...")
-    tx_arrivals = precompute_tx_arrivals(
+    print("Precomputing transmit arrival times and weights...")
+    tx_arrivals, tx_weights = precompute_tx_arrivals(
         tx_events=setup["TX"],
         elem_pos_m_full=elem_pos_m_full,
         scan_coords_m=scan_coords_m,
@@ -285,7 +295,10 @@ def main():
         lam=lam,
         sound_speed_m_s=c,
         dtype=dtype,
-    ).to(dtype=beamform_dtype).contiguous()
+    )
+    tx_arrivals = tx_arrivals.to(dtype=beamform_dtype).contiguous()
+    tx_weights = tx_weights.to(dtype=beamform_dtype).contiguous()
+    tx_weight_sum = tx_weights.sum(dim=0).reshape((nz, nx)).contiguous()
 
     dynamic_range = 50.0
     frame_numbers = []
@@ -345,6 +358,7 @@ def main():
                 else None
             )
 
+            # intermediate buffer, as mach beamforer does not support weighted summing into out
             hri_full = (
                 torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
                 if args.mode in ['full', 'both']
@@ -355,31 +369,48 @@ def main():
                 if args.mode in ['sparse', 'both']
                 else None
             )
+            lri_full = (
+                torch.zeros_like(hri_full)
+                if args.mode in ['full', 'both']
+                else None
+            )
+            lri_sparse = (
+                torch.zeros_like(hri_sparse)
+                if args.mode in ['sparse', 'both']
+                else None
+            )
 
             for i in range(n_tx):
+                tx_weight = tx_weights[i, :, None]
+
                 # Full beamforming
                 if args.mode in ['full', 'both']:
+                    lri_full.zero_()
                     beamform(
                         channel_data=rf_events_full[i],
                         rx_coords_m=elem_pos_m_full_bf,
                         tx_wave_arrivals_s=tx_arrivals[i],
-                        out=hri_full,
+                        out=lri_full,
                         **beamform_kwargs,
                     )
+                    hri_full += lri_full * tx_weight
                 
                 # Sparse beamforming (Downsampled Rx)
                 if args.mode in ['sparse', 'both']:
+                    lri_sparse.zero_()
                     beamform(
                         channel_data=rf_events_sparse[i],
                         rx_coords_m=elem_pos_m_sparse_bf,
                         tx_wave_arrivals_s=tx_arrivals[i],
-                        out=hri_sparse,
+                        out=lri_sparse,
                         **beamform_kwargs,
                     )
+                    hri_sparse += lri_sparse * tx_weight
                     
             # Envelope detection and display compression for this batch.
             if args.mode in ['full', 'both']:
                 env_full = torch_hilbert_envelope(hri_full.reshape((nz, nx, n_batch_frames)), dim=0)
+                env_full = env_full / (tx_weight_sum[:, :, None] + 1e-6)
                 full_display_frames.extend(
                     log_compress_for_display(env_full[:, :, idx], dynamic_range=dynamic_range)
                     for idx in range(n_batch_frames)
@@ -387,13 +418,14 @@ def main():
                 
             if args.mode in ['sparse', 'both']:
                 env_sparse = torch_hilbert_envelope(hri_sparse.reshape((nz, nx, n_batch_frames)), dim=0)
+                env_sparse = env_sparse / (tx_weight_sum[:, :, None] + 1e-6)
                 sparse_display_frames.extend(
                     log_compress_for_display(env_sparse[:, :, idx], dynamic_range=dynamic_range)
                     for idx in range(n_batch_frames)
                 )
 
             frame_numbers.extend(batch_frame_numbers)
-            del rf_batch, rf_events_full, rf_events_sparse, hri_full, hri_sparse
+            del rf_batch, rf_events_full, rf_events_sparse, hri_full, hri_sparse, lri_full, lri_sparse
 
     if not frame_numbers:
         raise ValueError("No frames were loaded; check --start, --stop, and --step.")
