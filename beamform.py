@@ -142,33 +142,38 @@ def main():
             # they should all be equal in theory
             t_focus = np.mean(delay_tx + dist_tx_to_focus / c)
 
-            dist_pixel_to_focus = np.linalg.norm(scan_coords_m - focal_point[None, :], axis=-1) # (nx*nz,)
-            is_post_focal = scan_coords_m[:, 2] >= z_f
-            sign = np.where(is_post_focal, 1.0, -1.0)
-            tx_arrivals_i = t_focus + (sign * dist_pixel_to_focus / c) # (nx*nz,)
-            
-            # --- Transmit Amplitude Approximation (Gaussian Beam) ---
-            # Estimate aperture size (D)
+            # --- 1. Compute Beam Parameters First ---
             if len(elem_tx) > 0:
                 D = np.max(elem_tx[:, 0]) - np.min(elem_tx[:, 0])
-                D = max(D, 1e-4) # Avoid division by zero
+                D = max(D, 1e-4) 
             else:
                 D = 1e-4
                 
             F_num = z_f / D
-            w_0 = lam * F_num  # Beam waist (approximate focal spot size)
+            w_0 = lam * F_num  # Beam waist 
             z_R = np.pi * (w_0 ** 2) / lam  # Rayleigh range
             
-            # Calculate beam width at each pixel's depth
             z_diff = scan_coords_m[:, 2] - z_f # (nx*nz,)
-            w_z = w_0 * np.sqrt(1 + (z_diff / z_R)**2)
-            
-            
-            # Calculate Gaussian amplitude profile for this specific transmit
             dx = scan_coords_m[:, 0] - x_f # (nx*nz,)
-            A_tx_i = np.sqrt(w_0 / w_z) * np.exp(- (dx ** 2) / (w_z ** 2)) # (nx*nz,)
+
+            # --- 2. Gaussian Wavefront Delay (Replacing VSM) ---
+            # Avoid division by zero right at the focal plane
+            epsilon_z = 1e-9
+            z_diff_safe = np.where(np.abs(z_diff) < epsilon_z, epsilon_z, z_diff)
             
-            # Reshape for broadcasting against the (nx*nz, 1) hri arrays
+            # Calculate the radius of the wavefront curvature
+            # (Approaches infinity at the focus, meaning a flat wavefront)
+            R_curvature = z_diff_safe * (1.0 + (z_R / z_diff_safe)**2)
+            
+            # The true continuous distance, replacing the sharp VSM cone
+            dist_gaussian = z_diff + (dx ** 2) / (2.0 * R_curvature)
+            
+            tx_arrivals_i = t_focus + (dist_gaussian / c)
+            
+            # --- 3. Amplitude Weighting (STA) ---
+            w_z = w_0 * np.sqrt(1 + (z_diff / z_R)**2)
+            A_tx_i = np.sqrt(w_0 / w_z) * np.exp(- (dx ** 2) / (w_z ** 2)) 
+            
             A_tx_i_weight = A_tx_i.reshape(-1, 1)
             Atx_total += A_tx_i
 
