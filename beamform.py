@@ -1,4 +1,4 @@
-import argparse
+-canimport argparse
 from pathlib import Path
 
 import h5py
@@ -137,9 +137,9 @@ def main():
             z_f = tx_i.focus * lam
             focal_point = np.array([x_f, 0.0, z_f])
             
-            #distance of the focal point to all active tx elements
+            # distance of the focal point to all active tx elements
             dist_tx_to_focus = np.linalg.norm(elem_tx - focal_point[None, :], axis=-1) # (n_active_tx_elem,)
-            # they should all be equal in theory
+            # t_focus should all be equal in theory, as delay_tx should ensure all waves arrive at the same time
             t_focus = np.mean(delay_tx + dist_tx_to_focus / c)
 
             # --- 1. Compute Beam Parameters First ---
