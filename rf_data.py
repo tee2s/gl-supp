@@ -1,13 +1,46 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 import h5py
 import torch
+
+
+RF_FILE_SUFFIXES = {".h5", ".hdf5", ".mat"}
 
 
 @dataclass(frozen=True)
 class RfFrameBatch:
     frame_numbers: list[int]
     data: torch.Tensor
+
+
+def iter_rf_data_paths(rf_path: str | Path):
+    """Yield RF data files from a single file path or a directory."""
+    rf_path = Path(rf_path)
+    if rf_path.is_file():
+        yield rf_path
+        return
+
+    if not rf_path.is_dir():
+        raise FileNotFoundError(f"RF path does not exist: {rf_path}")
+
+    data_paths = sorted(
+        path
+        for path in rf_path.iterdir()
+        if path.is_file() and _is_rf_data_file(path)
+    )
+    if not data_paths:
+        raise FileNotFoundError(f"no RF data files found in directory: {rf_path}")
+
+    yield from data_paths
+
+
+def _is_rf_data_file(path: Path) -> bool:
+    if path.suffix.lower() not in RF_FILE_SUFFIXES or not h5py.is_hdf5(path):
+        return False
+
+    with h5py.File(path, "r") as f:
+        return "rf" in f or "RcvData" in f
 
 
 def get_rf_dataset(h5_file: h5py.File) -> h5py.Dataset:

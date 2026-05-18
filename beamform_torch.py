@@ -1,13 +1,104 @@
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+import tomllib
 
 import matplotlib.pyplot as plt
 import torch
-from acquisition import load_mat_acquisition_params
+from acquisition import load_acquisition_params
 from matplotlib.animation import FuncAnimation, writers
 from mach import beamform
 from mach.kernel import InterpolationType
-from rf_data import iter_rf_frame_batches
+from rf_data import iter_rf_data_paths, iter_rf_frame_batches
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    rf_path: Path
+    params_file: Path | None
+    start: int
+    stop: int
+    step: int
+    mode: str
+    channel_skip: int
+    device: str
+    dtype: str
+    out_format: str
+    out_dir: Path
+    frame_batch_size: int
+
+
+def load_run_config(config_path):
+    config_path = Path(config_path)
+    with config_path.open("rb") as f:
+        raw_config = tomllib.load(f)
+
+    base_dir = config_path.parent
+    data = _required_table(raw_config, "data")
+    frames = _optional_table(raw_config, "frames")
+    beamforming = _optional_table(raw_config, "beamforming")
+    output = _optional_table(raw_config, "output")
+
+    config = RunConfig(
+        rf_path=_resolve_config_path(_required_value(data, "rf_path", "data"), base_dir),
+        params_file=(
+            _resolve_config_path(data["params_file"], base_dir)
+            if "params_file" in data
+            else None
+        ),
+        start=int(frames.get("start", 0)),
+        stop=int(frames.get("stop", 2)),
+        step=int(frames.get("step", 1)),
+        frame_batch_size=int(frames.get("batch_size", 10)),
+        mode=beamforming.get("mode", "both"),
+        channel_skip=int(beamforming.get("channel_skip", 2)),
+        device=beamforming.get("device", "auto"),
+        dtype=beamforming.get("dtype", "float32"),
+        out_format=output.get("format", "plot"),
+        out_dir=_resolve_config_path(output.get("dir", "."), base_dir),
+    )
+    validate_run_config(config)
+    return config
+
+
+def _required_table(config, table_name):
+    table = config.get(table_name)
+    if not isinstance(table, dict):
+        raise ValueError(f"config is missing required [{table_name}] table")
+    return table
+
+
+def _optional_table(config, table_name):
+    table = config.get(table_name, {})
+    if not isinstance(table, dict):
+        raise ValueError(f"config [{table_name}] must be a table")
+    return table
+
+
+def _required_value(table, key, section_name):
+    if key not in table:
+        raise ValueError(f"config is missing required '{key}' in [{section_name}]")
+    return table[key]
+
+
+def _resolve_config_path(value, base_dir):
+    path = Path(value)
+    return path if path.is_absolute() else base_dir / path
+
+
+def validate_run_config(config):
+    if config.step <= 0:
+        raise ValueError("[frames] step must be positive.")
+    if config.channel_skip <= 0:
+        raise ValueError("[beamforming] channel_skip must be positive.")
+    if config.frame_batch_size <= 0:
+        raise ValueError("[frames] batch_size must be positive.")
+    if config.mode not in {"full", "sparse", "both"}:
+        raise ValueError("[beamforming] mode must be one of: full, sparse, both.")
+    if config.dtype not in {"float32", "float64"}:
+        raise ValueError("[beamforming] dtype must be one of: float32, float64.")
+    if config.out_format not in {"plot", "video", "both"}:
+        raise ValueError("[output] format must be one of: plot, video, both.")
 
 
 def resolve_device(device_name):
@@ -178,88 +269,21 @@ def precompute_tx_arrivals(*, tx_events, elem_pos_m_full, scan_coords_m, fc, lam
     return torch.stack(tx_arrivals, dim=0), torch.stack(tx_weights, dim=0)
 
 
-def main():
-    # --- 1. Parse Command Line Arguments ---
-    parser = argparse.ArgumentParser(description="Beamform ultrasound frames with optional Rx downsampling.")
-    parser.add_argument(
-        "data_file",
-        nargs="?",
-        default="131626.mat",
-        help="Input RF data .mat file, either a full path or a filename in the data directory",
-    )
-    parser.add_argument('--start', type=int, default=0, help="Start frame index")
-    parser.add_argument('--stop', type=int, default=2, help="Stop frame index (exclusive)")
-    parser.add_argument('--step', type=int, default=1, help="Frame step size")
-    parser.add_argument('--mode', type=str, choices=['full', 'sparse', 'both'], default='both', 
-                        help="Beamforming mode: 'full', 'sparse', or 'both'")
-    parser.add_argument('--channel-skip', type=int, default=2, 
-                        help="Stride for downsampling receive channels (e.g., 2 means use every 2nd channel)")
-    parser.add_argument(
-        "--device",
-        default="auto",
-        help="Torch device for surrounding numeric work: 'auto', 'cpu', 'cuda', or a device like 'cuda:0'",
-    )
-    parser.add_argument(
-        "--dtype",
-        choices=["float32", "float64"],
-        default="float32",
-        help="Torch dtype for geometry and timing calculations",
-    )
-    parser.add_argument(
-        "--out-format",
-        choices=["plot", "video", "both"],
-        default="plot",
-        help="Output format: PNG plot, MP4 video, or both",
-    )
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        default=Path("."),
-        help="Directory where output PNG and MP4 files will be written",
-    )
-    parser.add_argument(
-        "--frame-batch-size",
-        type=int,
-        default=10,
-        help="Number of frames to load and beamform at once",
-    )
-    parser.add_argument(
-        "--setup-file",
-        type=Path,
-        default=None,
-        help="Path to MATLAB setup metadata. Defaults to setup.mat in the base data directory.",
-    )
-    args = parser.parse_args()
+def process_rf_file(config, data_path, *, device, dtype, beamform_dtype):
+    params_path = config.params_file or data_path
+    if not data_path.is_file():
+        raise FileNotFoundError(f"RF data file does not exist: {data_path}")
+    if not params_path.is_file():
+        raise FileNotFoundError(f"acquisition parameter file does not exist: {params_path}")
 
-    if args.step <= 0:
-        raise ValueError("--step must be positive.")
-    if args.channel_skip <= 0:
-        raise ValueError("--channel-skip must be positive.")
-    if args.frame_batch_size <= 0:
-        raise ValueError("--frame-batch-size must be positive.")
-
-    device = resolve_device(args.device)
-    dtype = resolve_dtype(args.dtype)
-    beamform_dtype = torch.float32
-    ensure_torch_mach_compat()
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Using torch device={device}, dtype={dtype}")
-
-    # --- 2. Load Data and Acquisition Parameters ---
-    base_dir = Path("/proj/yzlinlab/projects/jhu_spatiotemporal/data260421")
-    data_path = Path(args.data_file)
-    
-    if not data_path.is_absolute():
-        data_path = base_dir / data_path
-
+    print("-" * 80)
     print(f"Processing Data in {data_path}")
+    print(f"Loading acquisition parameters from {params_path}")
+    acquisition = load_acquisition_params(params_path)
     
-    setup_path = args.setup_file or base_dir / "setup.mat"
-    acquisition = load_mat_acquisition_params(setup_path)
-    
-    frame_indices = list(range(args.start, args.stop, args.step))
+    frame_indices = list(range(config.start, config.stop, config.step))
     if not frame_indices:
-        raise ValueError("No frames were loaded; check --start, --stop, and --step.")
+        raise ValueError("No frames were loaded; check [frames] start, stop, and step.")
 
     c = acquisition.sound_speed_m_s
     fc = acquisition.center_frequency_hz
@@ -292,7 +316,7 @@ def main():
     elem_pos_m_full_bf = elem_pos_m_full.to(dtype=beamform_dtype).contiguous()
     
     # Downsample receive element positions to match channel downsampling
-    elem_pos_m_sparse_bf = elem_pos_m_full_bf[::args.channel_skip, :].contiguous()
+    elem_pos_m_sparse_bf = elem_pos_m_full_bf[::config.channel_skip, :].contiguous()
 
     print("Precomputing transmit arrival times and weights...")
     tx_arrivals, tx_weights = precompute_tx_arrivals(
@@ -315,7 +339,7 @@ def main():
 
     print(
         f"Beamforming {len(frame_indices)} frame(s) across {n_tx} transmit event(s) "
-        f"in batches of {args.frame_batch_size}..."
+        f"in batches of {config.frame_batch_size}..."
     )
     beamform_kwargs = dict(
         scan_coords_m=scan_coords_m_bf,
@@ -330,8 +354,8 @@ def main():
     for rf_frame_batch in iter_rf_frame_batches(
         data_path,
         frame_indices=frame_indices,
-        frame_batch_size=args.frame_batch_size,
-        frame_step=args.step,
+        frame_batch_size=config.frame_batch_size,
+        frame_step=config.step,
         n_samples=n_total_samples,
         device=device,
         dtype=beamform_dtype,
@@ -347,34 +371,34 @@ def main():
 
         rf_events_full = (
             rf_batch.permute(2, 1, 3, 0).contiguous()
-            if args.mode in ['full', 'both']
+            if config.mode in ['full', 'both']
             else None
         )
         rf_events_sparse = (
-            rf_batch[:, ::args.channel_skip, :, :].permute(2, 1, 3, 0).contiguous()
-            if args.mode in ['sparse', 'both']
+            rf_batch[:, ::config.channel_skip, :, :].permute(2, 1, 3, 0).contiguous()
+            if config.mode in ['sparse', 'both']
             else None
         )
 
         # intermediate buffer, as mach beamformer does not support weighted summing into out
         hri_full = (
             torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
-            if args.mode in ['full', 'both']
+            if config.mode in ['full', 'both']
             else None
         )
         hri_sparse = (
             torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
-            if args.mode in ['sparse', 'both']
+            if config.mode in ['sparse', 'both']
             else None
         )
         lri_full = (
             torch.zeros_like(hri_full)
-            if args.mode in ['full', 'both']
+            if config.mode in ['full', 'both']
             else None
         )
         lri_sparse = (
             torch.zeros_like(hri_sparse)
-            if args.mode in ['sparse', 'both']
+            if config.mode in ['sparse', 'both']
             else None
         )
 
@@ -382,7 +406,7 @@ def main():
             tx_weight = tx_weights[i, :, None]
 
             # Full beamforming
-            if args.mode in ['full', 'both']:
+            if config.mode in ['full', 'both']:
                 lri_full.zero_()
                 beamform(
                     channel_data=rf_events_full[i],
@@ -394,7 +418,7 @@ def main():
                 hri_full += lri_full * tx_weight
             
             # Sparse beamforming (Downsampled Rx)
-            if args.mode in ['sparse', 'both']:
+            if config.mode in ['sparse', 'both']:
                 lri_sparse.zero_()
                 beamform(
                     channel_data=rf_events_sparse[i],
@@ -406,7 +430,7 @@ def main():
                 hri_sparse += lri_sparse * tx_weight
                 
         # Envelope detection and display compression for this batch.
-        if args.mode in ['full', 'both']:
+        if config.mode in ['full', 'both']:
             env_full = torch_hilbert_envelope(hri_full.reshape((nz, nx, n_batch_frames)), dim=0)
             env_full = env_full / (tx_weight_sum[:, :, None] + 1e-6)
             full_display_frames.extend(
@@ -414,7 +438,7 @@ def main():
                 for idx in range(n_batch_frames)
             )
             
-        if args.mode in ['sparse', 'both']:
+        if config.mode in ['sparse', 'both']:
             env_sparse = torch_hilbert_envelope(hri_sparse.reshape((nz, nx, n_batch_frames)), dim=0)
             env_sparse = env_sparse / (tx_weight_sum[:, :, None] + 1e-6)
             sparse_display_frames.extend(
@@ -426,7 +450,7 @@ def main():
         del rf_batch, rf_events_full, rf_events_sparse, hri_full, hri_sparse, lri_full, lri_sparse
 
     if not frame_numbers:
-        raise ValueError("No frames were loaded; check --start, --stop, and --step.")
+        raise ValueError("No frames were loaded; check [frames] start, stop, and step.")
     n_frames_loaded = len(frame_numbers)
 
     # --- 5. Generate Outputs ---
@@ -437,21 +461,24 @@ def main():
         (z.min() * lam * 1e3).item(),
     ]
 
-    output_stem = f"b_mode_{data_path.stem}_frames_{args.start}_to_{args.stop}_step_{args.step}_mode_{args.mode}"
+    output_stem = (
+        f"b_mode_{data_path.stem}_frames_{config.start}_to_{config.stop}_"
+        f"step_{config.step}_mode_{config.mode}"
+    )
 
-    if args.out_format in ["plot", "both"]:
+    if config.out_format in ["plot", "both"]:
         print("Generating comparison plot...")
     
         # Setup grid rows based on mode. squeeze=False ensures axes is always a 2D array [row, col]
-        n_rows = 2 if args.mode == 'both' else 1
+        n_rows = 2 if config.mode == 'both' else 1
         fig, axes = plt.subplots(n_rows, n_frames_loaded, figsize=(7 * n_frames_loaded, 7 * n_rows), squeeze=False)
         
-        row_sparse = 0 if args.mode in ['sparse', 'both'] else None
-        row_full = 1 if args.mode == 'both' else (0 if args.mode == 'full' else None)
+        row_sparse = 0 if config.mode in ['sparse', 'both'] else None
+        row_full = 1 if config.mode == 'both' else (0 if config.mode == 'full' else None)
 
         for idx, original_frame in enumerate(frame_numbers):
             # Plot Sparse
-            if args.mode in ['sparse', 'both']:
+            if config.mode in ['sparse', 'both']:
                 ax = axes[row_sparse, idx]
                 im = ax.imshow(
                     sparse_display_frames[idx],
@@ -460,13 +487,13 @@ def main():
                     vmax=0,
                     extent=extent,
                 )
-                ax.set_title(f"Sparse Rx (skip={args.channel_skip}) - Frame {original_frame}")
+                ax.set_title(f"Sparse Rx (skip={config.channel_skip}) - Frame {original_frame}")
                 ax.set_xlabel("Lateral (mm)")
                 if idx == 0: ax.set_ylabel("Axial (mm)")
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
 
             # Plot Full
-            if args.mode in ['full', 'both']:
+            if config.mode in ['full', 'both']:
                 ax = axes[row_full, idx]
                 im = ax.imshow(
                     full_display_frames[idx],
@@ -481,25 +508,56 @@ def main():
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
 
         plt.tight_layout()
-        plot_filename = args.out_dir / f"{output_stem}.png"
+        plot_filename = config.out_dir / f"{output_stem}.png"
         plt.savefig(plot_filename, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"Plot saved as '{plot_filename}'")
 
-    if args.out_format in ["video", "both"]:
+    if config.out_format in ["video", "both"]:
         print("Generating MP4 video...")
-        video_filename = args.out_dir / f"{output_stem}.mp4"
+        video_filename = config.out_dir / f"{output_stem}.mp4"
         save_video(
             filename=video_filename,
-            mode=args.mode,
+            mode=config.mode,
             sparse_frames=sparse_display_frames,
             full_frames=full_display_frames,
             frame_numbers=frame_numbers,
-            channel_skip=args.channel_skip,
+            channel_skip=config.channel_skip,
             dynamic_range=dynamic_range,
             extent=extent,
         )
         print(f"Video saved as '{video_filename}'")
+
+    print(f"Done processing {data_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Beamform ultrasound frames with optional Rx downsampling.")
+    parser.add_argument(
+        "config_file",
+        type=Path,
+        help="TOML run configuration file.",
+    )
+    args = parser.parse_args()
+    config = load_run_config(args.config_file)
+
+    device = resolve_device(config.device)
+    dtype = resolve_dtype(config.dtype)
+    beamform_dtype = torch.float32
+    ensure_torch_mach_compat()
+    config.out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Using torch device={device}, dtype={dtype}")
+
+    data_paths = list(iter_rf_data_paths(config.rf_path))
+    print(f"Found {len(data_paths)} RF data file(s) under {config.rf_path}")
+    for data_path in data_paths:
+        process_rf_file(
+            config,
+            data_path,
+            device=device,
+            dtype=dtype,
+            beamform_dtype=beamform_dtype,
+        )
 
     print("Done!")
 

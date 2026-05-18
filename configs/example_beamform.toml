@@ -1,0 +1,20 @@
+[data]
+# Can be a single file or a directory containing .mat/.h5/.hdf5 RF files.
+rf_path = "/path/to/rf_data"
+params_file = "/path/to/setup.mat"
+
+[frames]
+start = 0
+stop = 100
+step = 1
+batch_size = 10
+
+[beamforming]
+mode = "both"
+channel_skip = 16
+device = "cuda"
+dtype = "float32"
+
+[output]
+format = "video"
+dir = "/path/to/beamformed_videos/skip16"
