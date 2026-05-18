@@ -1,5 +1,5 @@
 import argparse
-import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import h5py
@@ -31,6 +31,100 @@ def resolve_dtype(dtype_name):
 
 def as_contiguous_tensor(value, *, device, dtype):
     return torch.as_tensor(value, device=device, dtype=dtype).contiguous()
+
+
+@dataclass(frozen=True)
+class RfFrameBatch:
+    frame_numbers: list[int]
+    data: torch.Tensor
+
+
+def get_rf_dataset(h5_file):
+    """Return RF data from either rechunked files or original MATLAB v7.3 files."""
+    if "rf" in h5_file:
+        return h5_file["rf"]
+
+    if "RcvData" not in h5_file:
+        raise KeyError("could not find 'rf' or 'RcvData' in input file")
+
+    return h5_file[h5_file["RcvData"][0, 0]]
+
+
+def load_rf_frame_batch(
+    dset,
+    *,
+    frame_start,
+    frame_stop,
+    frame_step,
+    n_samples,
+    device,
+    dtype,
+):
+    """Load HDF5 RF frames through pinned CPU memory, then copy to the target device."""
+    frame_count = len(range(frame_start, frame_stop, frame_step))
+    if frame_count == 0:
+        return None
+
+    _, n_rx, n_available_samples = dset.shape
+    n_samples = min(n_samples, n_available_samples)
+    use_pinned_memory = device.type == "cuda"
+
+    x_cpu = torch.empty(
+        (frame_count, n_rx, n_samples),
+        dtype=torch.int16,
+        pin_memory=use_pinned_memory,
+    )
+    dset.read_direct(
+        x_cpu.numpy(),
+        source_sel=(slice(frame_start, frame_stop, frame_step), slice(None), slice(0, n_samples)),
+    )
+
+    x_device = x_cpu.to(device, non_blocking=use_pinned_memory)
+    return x_device.to(dtype=dtype).contiguous()
+
+
+def iter_rf_frame_batches(
+    data_path,
+    *,
+    frame_indices,
+    frame_batch_size,
+    frame_step,
+    n_samples,
+    device,
+    dtype,
+):
+    """Yield RF frame batches loaded via pinned CPU memory and copied to device."""
+    with h5py.File(data_path, "r") as f:
+        rf_dset = get_rf_dataset(f)
+        print(
+            "RF dataset: "
+            f"shape={rf_dset.shape}, dtype={rf_dset.dtype}, "
+            f"chunks={rf_dset.chunks}, compression={rf_dset.compression}"
+        )
+
+        for batch_offset in range(0, len(frame_indices), frame_batch_size):
+            batch_frame_numbers = frame_indices[batch_offset : batch_offset + frame_batch_size]
+            batch_start = batch_frame_numbers[0]
+            batch_stop = batch_frame_numbers[-1] + frame_step
+            print(f"Loading frame batch {batch_frame_numbers[0]} to {batch_frame_numbers[-1]}...")
+
+            rf_batch = load_rf_frame_batch(
+                rf_dset,
+                frame_start=batch_start,
+                frame_stop=batch_stop,
+                frame_step=frame_step,
+                n_samples=n_samples,
+                device=device,
+                dtype=dtype,
+            )
+
+            if rf_batch is None:
+                continue
+
+            yield RfFrameBatch(
+                frame_numbers=batch_frame_numbers[: rf_batch.shape[0]],
+                data=rf_batch,
+            )
 
 
 def ensure_torch_mach_compat():
@@ -213,6 +307,12 @@ def main():
         help="Output format: PNG plot, MP4 video, or both",
     )
     parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("."),
+        help="Directory where output PNG and MP4 files will be written",
+    )
+    parser.add_argument(
         "--frame-batch-size",
         type=int,
         default=10,
@@ -231,6 +331,7 @@ def main():
     dtype = resolve_dtype(args.dtype)
     beamform_dtype = torch.float32
     ensure_torch_mach_compat()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Using torch device={device}, dtype={dtype}")
 
     # --- 2. Load Data and Acquisition Parameters ---
@@ -319,118 +420,107 @@ def main():
         tukey_alpha=0.1,
     )
 
-    total_data_load_elapsed_s = 0.0
-    with h5py.File(data_path, 'r') as f:
-        ref = f['RcvData'][0, 0]
+    for rf_frame_batch in iter_rf_frame_batches(
+        data_path,
+        frame_indices=frame_indices,
+        frame_batch_size=args.frame_batch_size,
+        frame_step=args.step,
+        n_samples=n_total_samples,
+        device=device,
+        dtype=beamform_dtype,
+    ):
+        rf_batch = rf_frame_batch.data
+        n_batch_frames = rf_batch.shape[0]
+        batch_frame_numbers = rf_frame_batch.frame_numbers
 
-        for batch_offset in range(0, len(frame_indices), args.frame_batch_size):
-            batch_indices = frame_indices[batch_offset : batch_offset + args.frame_batch_size]
-            batch_start = batch_indices[0]
-            batch_stop = batch_indices[-1] + args.step
-            print(f"Loading frame batch {batch_indices[0]} to {batch_indices[-1]}...")
+        # Reshape: (n_frames, n_rx, n_tx, n_samples_per_tx)
+        rf_batch = rf_batch.reshape(n_batch_frames, n_rx, n_tx, -1)
+        rf_batch = rf_batch[:, :, :, :n_valid_samples_per_tx].contiguous()
+        print(f"Loaded RF batch shape: {tuple(rf_batch.shape)}")
 
-            data_load_start = time.perf_counter()
-            rf_batch = f[ref][batch_start:batch_stop:args.step, :, :n_total_samples]
-            data_load_elapsed_s = time.perf_counter() - data_load_start
-            total_data_load_elapsed_s += data_load_elapsed_s
+        rf_events_full = (
+            rf_batch.permute(2, 1, 3, 0).contiguous()
+            if args.mode in ['full', 'both']
+            else None
+        )
+        rf_events_sparse = (
+            rf_batch[:, ::args.channel_skip, :, :].permute(2, 1, 3, 0).contiguous()
+            if args.mode in ['sparse', 'both']
+            else None
+        )
 
-            n_batch_frames = rf_batch.shape[0]
-            if n_batch_frames == 0:
-                continue
+        # intermediate buffer, as mach beamformer does not support weighted summing into out
+        hri_full = (
+            torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
+            if args.mode in ['full', 'both']
+            else None
+        )
+        hri_sparse = (
+            torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
+            if args.mode in ['sparse', 'both']
+            else None
+        )
+        lri_full = (
+            torch.zeros_like(hri_full)
+            if args.mode in ['full', 'both']
+            else None
+        )
+        lri_sparse = (
+            torch.zeros_like(hri_sparse)
+            if args.mode in ['sparse', 'both']
+            else None
+        )
 
-            batch_frame_numbers = batch_indices[:n_batch_frames]
-            print(f"Data loading took {data_load_elapsed_s:.2f} s")
+        for i in range(n_tx):
+            tx_weight = tx_weights[i, :, None]
 
-            # Reshape: (n_frames, n_rx, n_tx, n_samples_per_tx)
-            rf_batch = as_contiguous_tensor(rf_batch, device=device, dtype=beamform_dtype)
-            rf_batch = rf_batch.reshape(n_batch_frames, n_rx, n_tx, -1)
-            rf_batch = rf_batch[:, :, :, :n_valid_samples_per_tx].contiguous()
-            print(f"Loaded RF batch shape: {tuple(rf_batch.shape)}")
-
-            rf_events_full = (
-                rf_batch.permute(2, 1, 3, 0).contiguous()
-                if args.mode in ['full', 'both']
-                else None
-            )
-            rf_events_sparse = (
-                rf_batch[:, ::args.channel_skip, :, :].permute(2, 1, 3, 0).contiguous()
-                if args.mode in ['sparse', 'both']
-                else None
-            )
-
-            # intermediate buffer, as mach beamforer does not support weighted summing into out
-            hri_full = (
-                torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
-                if args.mode in ['full', 'both']
-                else None
-            )
-            hri_sparse = (
-                torch.zeros((scan_coords_m.shape[0], n_batch_frames), device=device, dtype=beamform_dtype)
-                if args.mode in ['sparse', 'both']
-                else None
-            )
-            lri_full = (
-                torch.zeros_like(hri_full)
-                if args.mode in ['full', 'both']
-                else None
-            )
-            lri_sparse = (
-                torch.zeros_like(hri_sparse)
-                if args.mode in ['sparse', 'both']
-                else None
-            )
-
-            for i in range(n_tx):
-                tx_weight = tx_weights[i, :, None]
-
-                # Full beamforming
-                if args.mode in ['full', 'both']:
-                    lri_full.zero_()
-                    beamform(
-                        channel_data=rf_events_full[i],
-                        rx_coords_m=elem_pos_m_full_bf,
-                        tx_wave_arrivals_s=tx_arrivals[i],
-                        out=lri_full,
-                        **beamform_kwargs,
-                    )
-                    hri_full += lri_full * tx_weight
-                
-                # Sparse beamforming (Downsampled Rx)
-                if args.mode in ['sparse', 'both']:
-                    lri_sparse.zero_()
-                    beamform(
-                        channel_data=rf_events_sparse[i],
-                        rx_coords_m=elem_pos_m_sparse_bf,
-                        tx_wave_arrivals_s=tx_arrivals[i],
-                        out=lri_sparse,
-                        **beamform_kwargs,
-                    )
-                    hri_sparse += lri_sparse * tx_weight
-                    
-            # Envelope detection and display compression for this batch.
+            # Full beamforming
             if args.mode in ['full', 'both']:
-                env_full = torch_hilbert_envelope(hri_full.reshape((nz, nx, n_batch_frames)), dim=0)
-                env_full = env_full / (tx_weight_sum[:, :, None] + 1e-6)
-                full_display_frames.extend(
-                    log_compress_for_display(env_full[:, :, idx], dynamic_range=dynamic_range)
-                    for idx in range(n_batch_frames)
+                lri_full.zero_()
+                beamform(
+                    channel_data=rf_events_full[i],
+                    rx_coords_m=elem_pos_m_full_bf,
+                    tx_wave_arrivals_s=tx_arrivals[i],
+                    out=lri_full,
+                    **beamform_kwargs,
                 )
-                
+                hri_full += lri_full * tx_weight
+            
+            # Sparse beamforming (Downsampled Rx)
             if args.mode in ['sparse', 'both']:
-                env_sparse = torch_hilbert_envelope(hri_sparse.reshape((nz, nx, n_batch_frames)), dim=0)
-                env_sparse = env_sparse / (tx_weight_sum[:, :, None] + 1e-6)
-                sparse_display_frames.extend(
-                    log_compress_for_display(env_sparse[:, :, idx], dynamic_range=dynamic_range)
-                    for idx in range(n_batch_frames)
+                lri_sparse.zero_()
+                beamform(
+                    channel_data=rf_events_sparse[i],
+                    rx_coords_m=elem_pos_m_sparse_bf,
+                    tx_wave_arrivals_s=tx_arrivals[i],
+                    out=lri_sparse,
+                    **beamform_kwargs,
                 )
+                hri_sparse += lri_sparse * tx_weight
+                
+        # Envelope detection and display compression for this batch.
+        if args.mode in ['full', 'both']:
+            env_full = torch_hilbert_envelope(hri_full.reshape((nz, nx, n_batch_frames)), dim=0)
+            env_full = env_full / (tx_weight_sum[:, :, None] + 1e-6)
+            full_display_frames.extend(
+                log_compress_for_display(env_full[:, :, idx], dynamic_range=dynamic_range)
+                for idx in range(n_batch_frames)
+            )
+            
+        if args.mode in ['sparse', 'both']:
+            env_sparse = torch_hilbert_envelope(hri_sparse.reshape((nz, nx, n_batch_frames)), dim=0)
+            env_sparse = env_sparse / (tx_weight_sum[:, :, None] + 1e-6)
+            sparse_display_frames.extend(
+                log_compress_for_display(env_sparse[:, :, idx], dynamic_range=dynamic_range)
+                for idx in range(n_batch_frames)
+            )
 
-            frame_numbers.extend(batch_frame_numbers)
-            del rf_batch, rf_events_full, rf_events_sparse, hri_full, hri_sparse, lri_full, lri_sparse
+        frame_numbers.extend(batch_frame_numbers)
+        del rf_batch, rf_events_full, rf_events_sparse, hri_full, hri_sparse, lri_full, lri_sparse
 
     if not frame_numbers:
         raise ValueError("No frames were loaded; check --start, --stop, and --step.")
     n_frames_loaded = len(frame_numbers)
-    print(f"Total data loading took {total_data_load_elapsed_s:.2f} s")
 
     # --- 5. Generate Outputs ---
     extent = [
@@ -484,14 +574,14 @@ def main():
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Magnitude (dB)")
 
         plt.tight_layout()
-        plot_filename = f"{output_stem}.png"
+        plot_filename = args.out_dir / f"{output_stem}.png"
         plt.savefig(plot_filename, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"Plot saved as '{plot_filename}'")
 
     if args.out_format in ["video", "both"]:
         print("Generating MP4 video...")
-        video_filename = f"{output_stem}.mp4"
+        video_filename = args.out_dir / f"{output_stem}.mp4"
         save_video(
             filename=video_filename,
             mode=args.mode,

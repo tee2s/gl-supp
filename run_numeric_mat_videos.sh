@@ -3,7 +3,8 @@ set -euo pipefail
 
 # gets the name of the directory where the script is stored, no matter from where it is called
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="/proj/yzlinlab/projects/jhu_spatiotemporal/data260421"
+DATA_DIR="/work/users/t/i/tis/data/jhu_spatiotemporal/fastdata260421_no_compression"
+OUT_DIR="/work/users/t/i/tis/data/jhu_spatiotemporal/beamformed_videos/skip8"
 
 shopt -s nullglob
 
@@ -19,7 +20,8 @@ for mat_file in "$DATA_DIR"/*.mat; do
         --start 0 \
         --stop 100 \
         --step 1 \
-        --channel-skip 16 \
+        --channel-skip 8 \
         --device cuda \
-        --out-format video
+        --out-format video \
+        --out-dir "$OUT_DIR"
 done
