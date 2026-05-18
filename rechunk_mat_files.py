@@ -9,22 +9,11 @@ from pathlib import Path
 from typing import Optional
 
 import h5py
+from rf_data import get_rf_dataset
 
 
 DEFAULT_N_TX = 128
 DEFAULT_SAMPLES_PER_TX = 1920
-
-
-def get_source_dataset(src: h5py.File) -> h5py.Dataset:
-    """Return the RF data dataset from either converted or original files."""
-    if "rf" in src:
-        return src["rf"]
-
-    if "RcvData" not in src:
-        raise KeyError("could not find 'rf' or 'RcvData' in source file")
-
-    ref = src["RcvData"][0, 0]
-    return src[ref]
 
 
 def rechunk_file(
@@ -42,7 +31,7 @@ def rechunk_file(
     dst_path.parent.mkdir(parents=True, exist_ok=True)
 
     with h5py.File(src_path, "r") as src:
-        src_dset = get_source_dataset(src)
+        src_dset = get_rf_dataset(src)
         n_frames, n_rx, n_samples = src_dset.shape
         output_samples = min(n_useful, n_samples)
         batch_size = frames_per_batch or n_frames

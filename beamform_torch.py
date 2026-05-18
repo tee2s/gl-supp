@@ -1,14 +1,13 @@
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
 
-import h5py
 import matplotlib.pyplot as plt
 import torch
+from acquisition import load_mat_acquisition_params
 from matplotlib.animation import FuncAnimation, writers
 from mach import beamform
 from mach.kernel import InterpolationType
-from scipy.io import loadmat
+from rf_data import iter_rf_frame_batches
 
 
 def resolve_device(device_name):
@@ -31,100 +30,6 @@ def resolve_dtype(dtype_name):
 
 def as_contiguous_tensor(value, *, device, dtype):
     return torch.as_tensor(value, device=device, dtype=dtype).contiguous()
-
-
-@dataclass(frozen=True)
-class RfFrameBatch:
-    frame_numbers: list[int]
-    data: torch.Tensor
-
-
-def get_rf_dataset(h5_file):
-    """Return RF data from either rechunked files or original MATLAB v7.3 files."""
-    if "rf" in h5_file:
-        return h5_file["rf"]
-
-    if "RcvData" not in h5_file:
-        raise KeyError("could not find 'rf' or 'RcvData' in input file")
-
-    return h5_file[h5_file["RcvData"][0, 0]]
-
-
-def load_rf_frame_batch(
-    dset,
-    *,
-    frame_start,
-    frame_stop,
-    frame_step,
-    n_samples,
-    device,
-    dtype,
-):
-    """Load HDF5 RF frames through pinned CPU memory, then copy to the target device."""
-    frame_count = len(range(frame_start, frame_stop, frame_step))
-    if frame_count == 0:
-        return None
-
-    _, n_rx, n_available_samples = dset.shape
-    n_samples = min(n_samples, n_available_samples)
-    use_pinned_memory = device.type == "cuda"
-
-    x_cpu = torch.empty(
-        (frame_count, n_rx, n_samples),
-        dtype=torch.int16,
-        pin_memory=use_pinned_memory,
-    )
-    dset.read_direct(
-        x_cpu.numpy(),
-        source_sel=(slice(frame_start, frame_stop, frame_step), slice(None), slice(0, n_samples)),
-    )
-
-    x_device = x_cpu.to(device, non_blocking=use_pinned_memory)
-    return x_device.to(dtype=dtype).contiguous()
-
-
-def iter_rf_frame_batches(
-    data_path,
-    *,
-    frame_indices,
-    frame_batch_size,
-    frame_step,
-    n_samples,
-    device,
-    dtype,
-):
-    """Yield RF frame batches loaded via pinned CPU memory and copied to device."""
-    with h5py.File(data_path, "r") as f:
-        rf_dset = get_rf_dataset(f)
-        print(
-            "RF dataset: "
-            f"shape={rf_dset.shape}, dtype={rf_dset.dtype}, "
-            f"chunks={rf_dset.chunks}, compression={rf_dset.compression}"
-        )
-
-        for batch_offset in range(0, len(frame_indices), frame_batch_size):
-            batch_frame_numbers = frame_indices[batch_offset : batch_offset + frame_batch_size]
-            batch_start = batch_frame_numbers[0]
-            batch_stop = batch_frame_numbers[-1] + frame_step
-            print(f"Loading frame batch {batch_frame_numbers[0]} to {batch_frame_numbers[-1]}...")
-
-            rf_batch = load_rf_frame_batch(
-                rf_dset,
-                frame_start=batch_start,
-                frame_stop=batch_stop,
-                frame_step=frame_step,
-                n_samples=n_samples,
-                device=device,
-                dtype=dtype,
-            )
-
-            if rf_batch is None:
-                continue
-
-            yield RfFrameBatch(
-                frame_numbers=batch_frame_numbers[: rf_batch.shape[0]],
-                data=rf_batch,
-            )
 
 
 def ensure_torch_mach_compat():
@@ -231,13 +136,13 @@ def precompute_tx_arrivals(*, tx_events, elem_pos_m_full, scan_coords_m, fc, lam
     
     # Loop to support different Apod masks and focused apertures per transmit.
     for tx_i in tx_events:
-        apod = torch.as_tensor(tx_i.Apod, device=elem_pos_m_full.device) > 0
-        delay_s = as_contiguous_tensor(tx_i.Delay, device=elem_pos_m_full.device, dtype=dtype) / fc
+        apod = torch.as_tensor(tx_i.apod, device=elem_pos_m_full.device) > 0
+        delay_s = as_contiguous_tensor(tx_i.delay_cycles, device=elem_pos_m_full.device, dtype=dtype) / fc
         elem_tx = elem_pos_m_full[apod]
         delay_tx = delay_s[apod]
 
-        x_f = tx_i.Origin[0] * lam
-        z_f = tx_i.focus * lam
+        x_f = tx_i.origin_wavelengths[0] * lam
+        z_f = tx_i.focus_wavelengths * lam
         focal_point = torch.tensor([x_f, 0.0, z_f], device=elem_pos_m_full.device, dtype=dtype)
 
         dist_tx_to_focus = torch.linalg.vector_norm(elem_tx - focal_point[None, :], dim=-1)
@@ -318,6 +223,12 @@ def main():
         default=10,
         help="Number of frames to load and beamform at once",
     )
+    parser.add_argument(
+        "--setup-file",
+        type=Path,
+        default=None,
+        help="Path to MATLAB setup metadata. Defaults to setup.mat in the base data directory.",
+    )
     args = parser.parse_args()
 
     if args.step <= 0:
@@ -343,33 +254,26 @@ def main():
 
     print(f"Processing Data in {data_path}")
     
-    setup_path = base_dir / "setup.mat"
-    setup = loadmat(setup_path, squeeze_me=True, struct_as_record=False)
+    setup_path = args.setup_file or base_dir / "setup.mat"
+    acquisition = load_mat_acquisition_params(setup_path)
     
     frame_indices = list(range(args.start, args.stop, args.step))
     if not frame_indices:
         raise ValueError("No frames were loaded; check --start, --stop, and --step.")
 
-    # Constants
-    c = 1540.0
-    fc = float(setup["Trans"].frequency * 1e6)
-    fs = 4 * fc
-    lam = c / fc
-    n_rx = 128
-    n_tx = 128
-    n_total_samples = 245760 # 1920 * 128
-    
-    receive0 = setup["Receive"][0]
-    start_depth = receive0.startDepth
-    end_depth = receive0.endDepth
-    n_valid_samples_per_tx = int(2 * (end_depth - start_depth) * (fs / fc))
+    c = acquisition.sound_speed_m_s
+    fc = acquisition.center_frequency_hz
+    fs = acquisition.sampling_frequency_hz
+    lam = acquisition.wavelength_m
+    n_rx = acquisition.n_rx
+    n_tx = acquisition.n_tx
+    n_total_samples = acquisition.n_total_samples
+    n_valid_samples_per_tx = acquisition.n_valid_samples_per_tx
 
     # --- 3. Image Grid Construction ---
-    pdata = setup["PData"]
-    origin = as_contiguous_tensor(pdata.Origin, device=device, dtype=dtype)
-    delta = as_contiguous_tensor(pdata.PDelta, device=device, dtype=dtype)
-    size = torch.as_tensor(pdata.Size)
-    nz, nx, ny = int(size[0].item()), int(size[1].item()), int(size[2].item())
+    origin = as_contiguous_tensor(acquisition.scan_origin_wavelengths, device=device, dtype=dtype)
+    delta = as_contiguous_tensor(acquisition.scan_delta_wavelengths, device=device, dtype=dtype)
+    nz, nx, ny = acquisition.scan_size
 
     x = origin[0] + torch.arange(nx, device=device, dtype=dtype) * delta[0]
     z = origin[2] + torch.arange(nz, device=device, dtype=dtype) * delta[2]
@@ -380,8 +284,11 @@ def main():
     scan_coords_m_bf = scan_coords_m.to(dtype=beamform_dtype).contiguous()
 
     # --- 4. Compute Transmit Arrival Times and Beamform ---
-    rx_start_s = 0.0
-    elem_pos_m_full = as_contiguous_tensor(setup["Trans"].ElementPos[:, :3], device=device, dtype=dtype) * lam
+    elem_pos_m_full = as_contiguous_tensor(
+        acquisition.element_positions_wavelengths,
+        device=device,
+        dtype=dtype,
+    ) * lam
     elem_pos_m_full_bf = elem_pos_m_full.to(dtype=beamform_dtype).contiguous()
     
     # Downsample receive element positions to match channel downsampling
@@ -389,7 +296,7 @@ def main():
 
     print("Precomputing transmit arrival times and weights...")
     tx_arrivals, tx_weights = precompute_tx_arrivals(
-        tx_events=setup["TX"],
+        tx_events=acquisition.tx_events,
         elem_pos_m_full=elem_pos_m_full,
         scan_coords_m=scan_coords_m,
         fc=fc,
@@ -412,7 +319,7 @@ def main():
     )
     beamform_kwargs = dict(
         scan_coords_m=scan_coords_m_bf,
-        rx_start_s=rx_start_s,
+        rx_start_s=acquisition.rx_start_s,
         sampling_freq_hz=fs,
         sound_speed_m_s=c,
         interp_type=InterpolationType.Linear,
